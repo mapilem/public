@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""
+Hive Bot - @stayout.bot
+Triggers: !stayout.bot -dv (downvote stats) | !stayout.bot -stats (posting stats)
+Dependencies: pip install lighthive sqlalchemy psycopg2-binary --break-system-packages
+Usage: python3 hive_bot.py
+"""
+
+import time, logging, json, os
+from lighthive.client import Client
+from lighthive.datastructures import Operation
+from sqlalchemy import create_engine, text
+
+BOT_ACCOUNT  = "stayout.bot" # bot name to be changed
+POSTING_KEY  = "HERECOMESTHEPRIVATEPOSTINGKEYOFTHEBOT"
+NOBROADCAST  = False  # True = test mode
+CACHE_FILE   = "welcomed_users.json"
+
+DB_URL = "postgresql+psycopg2://hafsql_public:hafsql_public@hafsql-sql.mahdiyari.info:5432/haf_block_log"
+HIVE_NODES = ["https://api.hive.blog", "https://api.deathwing.me", "https://hived.emre.sh"]
+DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger(__name__)
+replied_to = set()
+
+
+def load_welcomed():
+    """Load persisted welcomed users from file."""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE) as f:
+                return set(json.load(f))
+        except Exception as e:
+            log.warning(f"Could not load welcome cache: {e}")
+    return set()
+
+
+def save_welcomed(welcomed):
+    """Save welcomed users to file."""
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(list(welcomed), f)
+    except Exception as e:
+        log.warning(f"Could not save welcome cache: {e}")
+
+
+welcomed_users = load_welcomed()
+log.info(f"Loaded {len(welcomed_users)} welcomed users from cache")
+
+
+def get_engine():
+    return create_engine(DB_URL, connect_args={"connect_timeout": 30})
+
+
+def q(conn, sql, u):
+    return conn.execute(text(sql), {"u": u}).fetchone()
+
+
+# ── Downvote queries ───────────────────────────────────────────────────────────
+
+DV_TABLES = [
+    ("hafsql.operation_vote_view",
+     "SELECT COUNT(*) FROM hafsql.operation_vote_view WHERE author=:u AND weight<0",
+     "SELECT voter, COUNT(*) AS c FROM hafsql.operation_vote_view WHERE author=:u AND weight<0 GROUP BY voter ORDER BY c DESC LIMIT 1",
+     "SELECT COUNT(*) FROM hafsql.operation_vote_view WHERE voter=:u AND weight<0",
+     "SELECT author, COUNT(*) AS c FROM hafsql.operation_vote_view WHERE voter=:u AND weight<0 GROUP BY author ORDER BY c DESC LIMIT 1"),
+    ("hive.operations_view",
+     "SELECT COUNT(*) FROM hive.operations_view WHERE op_type_id=0 AND body->>'author'=:u AND (body->>'weight')::int<0",
+     "SELECT body->>'voter', COUNT(*) AS c FROM hive.operations_view WHERE op_type_id=0 AND body->>'author'=:u AND (body->>'weight')::int<0 GROUP BY body->>'voter' ORDER BY c DESC LIMIT 1",
+     "SELECT COUNT(*) FROM hive.operations_view WHERE op_type_id=0 AND body->>'voter'=:u AND (body->>'weight')::int<0",
+     "SELECT body->>'author', COUNT(*) AS c FROM hive.operations_view WHERE op_type_id=0 AND body->>'voter'=:u AND (body->>'weight')::int<0 GROUP BY body->>'author' ORDER BY c DESC LIMIT 1"),
+    ("hafd.operations",
+     "SELECT COUNT(*) FROM hafd.operations WHERE op_type_id=0 AND body->>'author'=:u AND (body->>'weight')::int<0",
+     "SELECT body->>'voter', COUNT(*) AS c FROM hafd.operations WHERE op_type_id=0 AND body->>'author'=:u AND (body->>'weight')::int<0 GROUP BY body->>'voter' ORDER BY c DESC LIMIT 1",
+     "SELECT COUNT(*) FROM hafd.operations WHERE op_type_id=0 AND body->>'voter'=:u AND (body->>'weight')::int<0",
+     "SELECT body->>'author', COUNT(*) AS c FROM hafd.operations WHERE op_type_id=0 AND body->>'voter'=:u AND (body->>'weight')::int<0 GROUP BY body->>'author' ORDER BY c DESC LIMIT 1"),
+]
+
+
+def query_dv(username):
+    """Returns (received, top_rv, top_rc, given, top_gv, top_gc)"""
+    with get_engine().connect() as conn:
+        for label, q_recv, q_top_recv, q_given, q_top_given in DV_TABLES:
+            try:
+                received  = int(q(conn, q_recv, username)[0])
+                top_recv  = q(conn, q_top_recv, username) if received > 0 else None
+                log.info(f"@{username} received={received} via {label}")
+                try:
+                    given     = int(q(conn, q_given, username)[0])
+                    top_given = q(conn, q_top_given, username) if given > 0 else None
+                    log.info(f"@{username} given={given} via {label}")
+                except Exception as e:
+                    log.warning(f"Given-query failed: {e}")
+                    given, top_given = 0, None
+                return (
+                    received,
+                    str(top_recv[0])  if top_recv  else None, int(top_recv[1])  if top_recv  else None,
+                    given,
+                    str(top_given[0]) if top_given else None, int(top_given[1]) if top_given else None,
+                )
+            except Exception as e:
+                log.debug(f"{label} failed: {e}")
+                try: conn.rollback()
+                except: pass
+    return None, None, None, None, None, None
+
+
+# ── Stats queries ──────────────────────────────────────────────────────────────
+
+STATS_SQL = {
+    "posts":        "SELECT COUNT(*) FROM hafsql.comments_table WHERE author=:u AND parent_author=''",
+    "comments":     "SELECT COUNT(*) FROM hafsql.comments_table WHERE author=:u AND parent_author!=''",
+    "avg_post_pay": "SELECT COALESCE(AVG(author_rewards_hbd),0) FROM hafsql.comments_table WHERE author=:u AND parent_author=''",
+    "avg_com_pay":  "SELECT COALESCE(AVG(author_rewards_hbd),0) FROM hafsql.comments_table WHERE author=:u AND parent_author!=''",
+    "zero_posts":   "SELECT COUNT(*) FROM hafsql.comments_table WHERE author=:u AND parent_author='' AND author_rewards_hbd=0",
+    "zero_com":     "SELECT COUNT(*) FROM hafsql.comments_table WHERE author=:u AND parent_author!='' AND author_rewards_hbd=0",
+    "best_post":    "SELECT MAX(author_rewards_hbd) FROM hafsql.comments_table WHERE author=:u AND parent_author=''",
+    "weekday":      """
+        SELECT EXTRACT(DOW FROM created)::int AS dow, COUNT(*) AS c
+        FROM hafsql.comments_table
+        WHERE author=:u AND parent_author=''
+        GROUP BY dow ORDER BY c DESC LIMIT 1
+    """,
+    "date_range":   "SELECT MIN(created), MAX(created) FROM hafsql.comments_table WHERE author=:u AND parent_author=''",
+    "col_check":    "SELECT column_name FROM information_schema.columns WHERE table_schema='hafsql' AND table_name='comments_table' ORDER BY column_name",
+    "post_days":    "SELECT DISTINCT created::date AS d FROM hafsql.comments_table WHERE author=:u AND parent_author='' ORDER BY d",
+}
+
+
+def query_stats(username):
+    """Returns dict with all stats, failed queries return None value."""
+    with get_engine().connect() as conn:
+        s = {}
+        for key, sql in STATS_SQL.items():
+            try:
+                if key in ("post_days", "col_check"):
+                    s[key] = conn.execute(text(sql), {"u": username}).fetchall()
+                else:
+                    s[key] = conn.execute(text(sql), {"u": username}).fetchone()
+            except Exception as e:
+                log.warning(f"Stats query '{key}' failed for @{username}: {e}")
+                s[key] = None
+                try: conn.rollback()
+                except: pass
+        log.info(f"Stats fetched for @{username}")
+        if s.get("col_check"):
+            cols = [r[0] for r in s["col_check"]]
+            log.info(f"hafsql.comments_table columns: {cols}")
+        return s
+
+
+def calc_streaks(post_days_rows):
+    """Calculate longest break and longest daily streak from list of post dates."""
+    from datetime import timedelta
+    if not post_days_rows:
+        return 0, 0
+    dates = sorted(row[0] for row in post_days_rows)
+    longest_break  = 0
+    longest_streak = 1
+    cur_streak     = 1
+    for i in range(1, len(dates)):
+        gap = (dates[i] - dates[i-1]).days
+        if gap > longest_break:
+            longest_break = gap
+        if gap == 1:
+            cur_streak += 1
+            longest_streak = max(longest_streak, cur_streak)
+        else:
+            cur_streak = 1
+    return longest_break, longest_streak
+
+
+# ── Reply builders ─────────────────────────────────────────────────────────────
+
+def build_dv_reply(username, received, top_rv, top_rc, given, top_gv, top_gc):
+    if received is None:
+        return f"@{username} – Sorry, data could not be retrieved. Please try again later."
+    if received == 0:
+        r = f"@{username} has received **no downvotes** so far. 🎉"
+    else:
+        r = f"@{username} has received **{received} downvote{'s' if received>1 else ''}** so far."
+        if top_rv:
+            r += f" Most came from @{top_rv} ({top_rc}x)."
+    if given == 0:
+        g = f"@{username} has given **no downvotes** so far."
+    else:
+        g = f"@{username} has given **{given} downvote{'s' if given>1 else ''}** so far."
+        if top_gv:
+            g += f" Most went to @{top_gv} ({top_gc}x)."
+    return f"{r} {g}"
+
+
+def build_stats_reply(username, s):
+    if s is None:
+        return f"@{username} – Sorry, stats could not be retrieved. Please try again later."
+
+    def val(key, idx=0, default=0, cast=float):
+        try: return cast(s[key][idx]) if s[key] and s[key][idx] is not None else default
+        except: return default
+
+    posts      = val("posts",        cast=int)
+    comments   = val("comments",     cast=int)
+    avg_pp     = val("avg_post_pay")
+    avg_cp     = val("avg_com_pay")
+    zero_posts = val("zero_posts",   cast=int)
+    zero_com   = val("zero_com",     cast=int)
+    best       = val("best_post")
+    dow        = val("weekday",      default=None, cast=lambda x: int(x) if x is not None else None)
+    dr         = s.get("date_range")
+
+    avg_week = 0
+    try:
+        if dr and dr[0] and dr[1] and posts > 0:
+            weeks = max((dr[1] - dr[0]).days / 7, 1)
+            avg_week = posts / weeks
+    except: pass
+
+    longest_break, longest_streak = 0, 0
+    try: longest_break, longest_streak = calc_streaks(s.get("post_days") or [])
+    except: pass
+
+    day_str = DAYS[dow] if dow is not None else "N/A"
+
+    return (
+        f"**@{username} Hive Stats:**\n"
+        f"- Posts: **{posts}** | Comments: **{comments}**\n"
+        f"- Avg. payout: **${avg_pp:.2f} HBD**/post | **${avg_cp:.2f} HBD**/comment\n"
+        f"- Zero payout: **{zero_posts}** posts | **{zero_com}** comments\n"
+        f"- Best post ever: **${best:.2f} HBD**\n"
+        f"- Avg. posts/week: **{avg_week:.1f}** | Most active day: **{day_str}**\n"
+        f"- Longest daily post streak: **{longest_streak} day(s)** | Longest break: **{longest_break} day(s)**"
+    )
+
+
+# ── Hive ───────────────────────────────────────────────────────────────────────
+
+def get_client():
+    return Client(nodes=HIVE_NODES, keys=[POSTING_KEY])
+
+
+def already_replied(client, author, permlink):
+    key = f"{author}/{permlink}"
+    if key in replied_to:
+        return True
+    try:
+        for r in client.get_content_replies(author, permlink):
+            if r.get("author") == BOT_ACCOUNT:
+                replied_to.add(key)
+                return True
+    except Exception as e:
+        log.warning(f"Duplicate check error (will reply anyway): {e}")
+    return False
+
+
+def post_reply(client, parent_author, parent_permlink, body):
+    ts   = str(int(time.time()))
+    perm = "".join(c if c.isalnum() or c=="-" else "-"
+                   for c in f"re-{parent_author}-{parent_permlink}-{ts}".lower())[:255]
+    op = Operation("comment", {
+        "parent_author": parent_author, "parent_permlink": parent_permlink,
+        "author": BOT_ACCOUNT, "permlink": perm, "title": "",
+        "body": body, "json_metadata": json.dumps({"app": "stayout.bot/1.0"}),
+    })
+    if NOBROADCAST:
+        log.info(f"[TESTMODE] Would reply:\n{body}")
+        replied_to.add(f"{parent_author}/{parent_permlink}")
+        return True
+    try:
+        replied_to.add(f"{parent_author}/{parent_permlink}")
+        client.broadcast(op)
+        return True
+    except Exception as e:
+        log.error(f"Error posting reply: {e}")
+        return False
+
+
+WELCOME_MSG = (
+    "Welcome to Hive! 🎉\n"
+    "Great to have you here! Take your time to explore, engage with the communities and don't hesitate to ask @stayoutoftherz if you need any help.\n"
+    "If you are interested, you might want to check out this post about the basics of how Hive works: https://peakd.com/hive-153850/@stayoutoftherz/hive-the-basics.\n"
+    "Wishing you a great start! 🚀"
+)
+
+WELCOME_SQL = "SELECT COUNT(*) FROM hafsql.comments_table WHERE author=:u AND parent_author=''"
+
+NEW_SQL = {
+    "posts":       "SELECT COUNT(*) FROM hafsql.comments_table WHERE parent_author='' AND created >= NOW() - INTERVAL '24 hours'",
+    "comments":    "SELECT COUNT(*) FROM hafsql.comments_table WHERE parent_author!='' AND created >= NOW() - INTERVAL '24 hours'",
+    "upvotes":     "SELECT COUNT(*) FROM hafsql.operation_vote_view WHERE weight>0 AND timestamp >= NOW() - INTERVAL '24 hours'",
+    "downvotes":   "SELECT COUNT(*) FROM hafsql.operation_vote_view WHERE weight<0 AND timestamp >= NOW() - INTERVAL '24 hours'",
+    "first_posts": """
+        SELECT author FROM hafsql.comments_table
+        WHERE parent_author='' AND created >= NOW() - INTERVAL '24 hours'
+        GROUP BY author
+        HAVING COUNT(*) = 1
+        AND NOT EXISTS (
+            SELECT 1 FROM hafsql.comments_table c2
+            WHERE c2.author = hafsql.comments_table.author
+            AND c2.parent_author = ''
+            AND c2.created < NOW() - INTERVAL '24 hours'
+        )
+        ORDER BY author
+    """,
+}
+
+
+
+
+def query_new(client):
+    """Returns dict with 24h Hive stats."""
+    with get_engine().connect() as conn:
+        s = {}
+        for key, sql in NEW_SQL.items():
+            try:
+
+                if key == 'first_posts':
+                    rows = conn.execute(text(sql)).fetchall()
+                    s[key] = [r[0] for r in rows]
+                else:
+                    row = conn.execute(text(sql)).fetchone()
+                    s[key] = row[0] if row else 0
+            except Exception as e:
+                log.warning(f"New-query '{key}' failed: {e}")
+                s[key] = None
+                try: conn.rollback()
+                except: pass
+
+        return s
+
+
+def build_new_reply(s):
+    def fmt(key):
+        v = s.get(key)
+        return f"{v:,}" if v is not None else "N/A"
+
+    lines = [
+        "**Hive in the last 24 hours:**",
+        f"📝 {fmt('posts')} posts published",
+        f"💬 {fmt('comments')} comments written",
+        f"👍 {fmt('upvotes')} upvotes | 👎 {fmt('downvotes')} downvotes",
+    ]
+    first = s.get('first_posts', [])
+    if isinstance(first, list):
+        count = len(first)
+        if count == 0:
+            pass
+        else:
+            names = ' '.join([f'@{u}' for u in first])
+            lines.append(f"✍️ {count} user{'s' if count>1 else ''} wrote their very first post: {names}")
+    else:
+        lines.append(f"✍️ {fmt('first_posts')} users wrote their very first post")
+    return "\n".join(lines)
+
+
+def is_first_post(username):
+    """Returns True if this is the user's first post."""
+    try:
+        with get_engine().connect() as conn:
+            row = conn.execute(text(WELCOME_SQL), {"u": username}).fetchone()
+            count = int(row[0]) if row else 0
+            return count == 1
+    except Exception as e:
+        log.warning(f"First-post check failed for @{username}: {e}")
+        return False
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def handle_comment(client, author, body, permlink, parent_author):
+    if author == BOT_ACCOUNT:
+        return
+
+    # Welcome new users on their first post (no trigger needed)
+    if parent_author == "":  # root post, not a comment
+        if is_first_post(author):
+            if author not in welcomed_users:
+                log.info(f"First post detected: @{author}/{permlink}")
+                if post_reply(client, author, permlink, WELCOME_MSG):
+                    welcomed_users.add(author)
+                    save_welcomed(welcomed_users)
+                    log.info(f"✓ Welcome sent to @{author}")
+                    time.sleep(3)
+            return
+
+    # Trigger-based commands
+    body_lower = body.lower()
+    if "!stayout.bot" not in body_lower:
+        return
+    if already_replied(client, author, permlink):
+        log.info("Already replied – skipping")
+        return
+
+    if "-dv" in body_lower:
+        log.info(f"Trigger -dv found: @{author}/{permlink}")
+        received, top_rv, top_rc, given, top_gv, top_gc = query_dv(author)
+        reply = build_dv_reply(author, received, top_rv, top_rc, given, top_gv, top_gc)
+    elif "-stats" in body_lower:
+        log.info(f"Trigger -stats found: @{author}/{permlink}")
+        s = query_stats(author)
+        reply = build_stats_reply(author, s)
+    elif "-new" in body_lower:
+        log.info(f"Trigger -new found: @{author}/{permlink}")
+        s = query_new(client)
+        reply = build_new_reply(s)
+    else:
+        return
+
+    if post_reply(client, author, permlink, reply):
+        log.info(f"✓ Replied to @{author}")
+        time.sleep(3)
+
+
+def run_bot():
+    log.info(f"Bot starting as @{BOT_ACCOUNT} | Test mode: {NOBROADCAST}")
+    client     = get_client()
+    last_block = client.get_dynamic_global_properties()["head_block_number"]
+    log.info(f"Starting at block #{last_block}")
+
+    while True:
+        try:
+            head_block = client.get_dynamic_global_properties()["head_block_number"]
+            for block_num in range(last_block + 1, head_block + 1):
+                try:
+                    block = client.get_block(block_num)
+                    if not block:
+                        continue
+                    for tx in block.get("transactions", []):
+                        for op_type, op_data in tx.get("operations", []):
+                            if op_type != "comment":
+                                continue
+                            handle_comment(
+                                client,
+                                op_data.get("author", ""),
+                                op_data.get("body", ""),
+                                op_data.get("permlink", ""),
+                                op_data.get("parent_author", ""),
+                            )
+                except Exception as e:
+                    log.error(f"Error at block #{block_num}: {e}")
+            last_block = head_block
+            time.sleep(3)
+        except KeyboardInterrupt:
+            log.info("Bot stopped.")
+            break
+        except Exception as e:
+            log.error(f"Main loop error: {e} – restarting in 10s...")
+            time.sleep(10)
+            client = get_client()
+
+
+if __name__ == "__main__":
+    if POSTING_KEY == "DEIN_POSTING_KEY_HIER":
+        print("ERROR: Please enter your Posting Key in the file under POSTING_KEY.")
+        exit(1)
+    run_bot()
