@@ -1,8 +1,8 @@
 Detailed description here:
 https://peakd.com/hive-139531/@stayoutoftherz/introducing-stayoutbot
-Summary:
 
 Bot commands:
+
 !stayout.bot -new: gives a brief summary of what has happened on Hive in the last 24 hours (how many posts, comments, upvotes, and which users wrote their very first post)
 
 !stayout.bot -dv: how many downvotes you have ever received and given, and from whom and to whom the most
