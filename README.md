@@ -1,4 +1,4 @@
-Detailed description here:
+Detailed description of the Hivebot here:
 https://peakd.com/hive-139531/@stayoutoftherz/introducing-stayoutbot
 
 Bot commands:
@@ -12,3 +12,5 @@ Bot commands:
 plus, it automatically checks the chain to see if an account is posting for the very first time, then sends it a short welcome message
 
 Don´t forget to customize before using (bot name, posting key, welcome message text)
+
+Separate File: check_transfers, to check outgoing transfers for any user and list the accounts to which most Hive / HBD had been transferred to
